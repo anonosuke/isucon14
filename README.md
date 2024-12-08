@@ -1,0 +1,3 @@
+- https://drive.google.com/file/d/1NSBDeorOvm1YkYYc4dqM9ADshLGGxszK/view?usp=drive_link
+- https://gist.github.com/wtks/0a3268de13856ed6e18c6560023ec436
+- https://gist.github.com/wtks/8eadf471daf7cb59942de02273ce7884
