@@ -111,35 +111,43 @@ module Isuride
     # GET /api/owner/chairs
     get '/chairs' do
       chairs = db.xquery(<<~SQL, @current_owner.id)
-        SELECT c.id,
-               c.owner_id,
-               c.name,
-               c.access_token,
-               c.model,
-               c.is_active,
-               c.created_at,
-               c.updated_at,
-               IFNULL(d.total_distance, 0) AS total_distance,
-               d.total_distance_updated_at
-        FROM chairs c
-        LEFT JOIN chair_distances d ON d.chair_id = c.id
-        WHERE c.owner_id = ?
+        SELECT id,
+        owner_id,
+        name,
+        access_token,
+        model,
+        is_active,
+        created_at,
+        updated_at,
+        IFNULL(total_distance, 0) AS total_distance,
+        total_distance_updated_at
+        FROM chairs
+        LEFT JOIN (SELECT chair_id,
+                           SUM(IFNULL(distance, 0)) AS total_distance,
+                           MAX(created_at)          AS total_distance_updated_at
+                    FROM (SELECT chair_id,
+                                 created_at,
+                                 ABS(latitude - LAG(latitude) OVER (PARTITION BY chair_id ORDER BY created_at)) +
+                                 ABS(longitude - LAG(longitude) OVER (PARTITION BY chair_id ORDER BY created_at)) AS distance
+                          FROM chair_locations) tmp
+                    GROUP BY chair_id) distance_table ON distance_table.chair_id = chairs.id
+        WHERE owner_id = ?
       SQL
-    
+
       json(
         chairs: chairs.map { |chair|
-          result = {
+          {
             id: chair.fetch(:id),
             name: chair.fetch(:name),
             model: chair.fetch(:model),
             active: chair.fetch(:is_active),
             registered_at: time_msec(chair.fetch(:created_at)),
             total_distance: chair.fetch(:total_distance),
-          }
-          if chair.fetch(:total_distance_updated_at)
-            result[:total_distance_updated_at] = time_msec(chair.fetch(:total_distance_updated_at))
+          }.tap do |c|
+            unless chair.fetch(:total_distance_updated_at).nil?
+              c[:total_distance_updated_at] = time_msec(chair.fetch(:total_distance_updated_at))
+            end
           end
-          result
         },
       )
     end
