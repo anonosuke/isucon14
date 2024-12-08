@@ -366,105 +366,88 @@ module Isuride
 
     # GET /api/app/nearby-chairs
     get '/nearby-chairs' do
-      latitude, longitude, distance = parse_query_params(params)
-    
-      response = db_transaction do |tx|
-        # 1. アクティブなchairsを一括取得
-        chairs = tx.xquery('SELECT id, name, model FROM chairs WHERE is_active = 1')
-    
-        chair_ids = chairs.map { |c| c[:id] }
-        if chair_ids.empty?
-          next {
-            chairs: [],
-            retrieved_at: time_msec(tx.query('SELECT CURRENT_TIMESTAMP(6)', as: :array).first[0])
-          }
+      lat_str = params[:latitude]
+      lon_str = params[:longitude]
+      distance_str = params[:distance]
+      if lat_str.nil? || lon_str.nil?
+        raise HttpError.new(400, 'latitude or longitude is empty')
+      end
+
+      latitude =
+        begin
+          Integer(lat_str, 10)
+        rescue
+          raise HttpError.new(400, 'latitude is invalid')
         end
-    
-        # 2. 全chairsに対して最新ライドを一括取得
-        rides = tx.xquery(<<~SQL, chair_ids)
-          SELECT r.chair_id, r.id AS ride_id
-          FROM rides r
-          JOIN (
-            SELECT chair_id, MAX(created_at) AS max_created_at
-            FROM rides
-            WHERE chair_id IN (#{(['?'] * chair_ids.size).join(',')})
-            GROUP BY chair_id
-          ) lr ON lr.chair_id = r.chair_id AND lr.max_created_at = r.created_at
-        SQL
-    
-        # chair_id -> ride_idのマッピング
-        chair_to_ride = rides.each_with_object({}) { |r, h| h[r[:chair_id]] = r[:ride_id] }
-    
-        # 3. 最新ステータスを一括取得
-        ride_ids = chair_to_ride.values.compact
-        statuses = {}
-        unless ride_ids.empty?
-          ride_statuses = tx.xquery(<<~SQL, ride_ids)
-            SELECT rs.ride_id, rs.status
-            FROM ride_statuses rs
-            JOIN (
-              SELECT ride_id, MAX(created_at) AS max_created_at
-              FROM ride_statuses
-              WHERE ride_id IN (#{(['?'] * ride_ids.size).join(',')})
-              GROUP BY ride_id
-            ) ls ON ls.ride_id = rs.ride_id AND ls.max_created_at = rs.created_at
-          SQL
-    
-          ride_statuses.each do |rs|
-            statuses[rs[:ride_id]] = rs[:status]
+
+      longitude =
+        begin
+          Integer(lon_str, 10)
+        rescue
+          raise HttpError.new(400, 'longitude is invalid')
+        end
+
+      distance =
+        if distance_str.nil?
+          50
+        else
+          begin
+            Integer(distance_str, 10)
+          rescue
+            raise HttpError.new(400, 'distance is invalid')
           end
         end
-    
-        # 4. 最新位置情報を一括取得
-        chair_locations = tx.xquery(<<~SQL, chair_ids)
-          SELECT cl.chair_id, cl.latitude, cl.longitude
-          FROM chair_locations cl
-          JOIN (
-            SELECT chair_id, MAX(created_at) AS max_created_at
-            FROM chair_locations
-            WHERE chair_id IN (#{(['?'] * chair_ids.size).join(',')})
-            GROUP BY chair_id
-          ) lcl ON lcl.chair_id = cl.chair_id AND lcl.max_created_at = cl.created_at
-        SQL
-    
-        location_map = {}
-        chair_locations.each do |loc|
-          location_map[loc[:chair_id]] = { latitude: loc[:latitude], longitude: loc[:longitude] }
-        end
-    
-        # 5. フィルタリング
-        nearby_chairs = []
-        chairs.each do |c|
-          ride_id = chair_to_ride[c[:id]]
-          # ライドが存在し、かつ完了していない場合はスキップ
-          if ride_id && statuses[ride_id] != 'COMPLETED'
+
+      response = db_transaction do |tx|
+        chairs = tx.query('SELECT * FROM chairs')
+
+        nearby_chairs = chairs.filter_map do |chair|
+          unless chair.fetch(:is_active)
             next
           end
-    
-          loc = location_map[c[:id]]
-          next if loc.nil?
-    
-          if calculate_distance(latitude, longitude, loc[:latitude], loc[:longitude]) <= distance
-            nearby_chairs << {
-              id: c[:id],
-              name: c[:name],
-              model: c[:model],
+
+          rides = tx.xquery('SELECT * FROM rides WHERE chair_id = ? ORDER BY created_at DESC LIMIT 1', chair.fetch(:id))
+
+          skip = false
+          rides.each do |ride|
+            # 過去にライドが存在し、かつ、それが完了していない場合はスキップ
+            status = get_latest_ride_status(tx, ride.fetch(:id))
+            if status != 'COMPLETED'
+              skip = true
+              break
+            end
+          end
+          if skip
+            next
+          end
+
+          # 最新の位置情報を取得
+          chair_location = tx.xquery('SELECT * FROM chair_locations WHERE chair_id = ? ORDER BY created_at DESC LIMIT 1', chair.fetch(:id)).first
+          if chair_location.nil?
+            next
+          end
+
+          if calculate_distance(latitude, longitude, chair_location.fetch(:latitude), chair_location.fetch(:longitude)) <= distance
+            {
+              id: chair.fetch(:id),
+              name: chair.fetch(:name),
+              model: chair.fetch(:model),
               current_coordinate: {
-                latitude: loc[:latitude],
-                longitude: loc[:longitude],
+                latitude: chair_location.fetch(:latitude),
+                longitude: chair_location.fetch(:longitude),
               },
             }
           end
         end
-    
+
         retrieved_at = tx.query('SELECT CURRENT_TIMESTAMP(6)', as: :array).first[0]
-    
+
         {
           chairs: nearby_chairs,
           retrieved_at: time_msec(retrieved_at),
         }
       end
-    
+
       json(response)
     end
 
