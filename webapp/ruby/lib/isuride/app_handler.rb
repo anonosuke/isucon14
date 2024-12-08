@@ -311,56 +311,58 @@ module Isuride
       response = db_transaction do |tx|
         ride = tx.xquery('SELECT * FROM rides WHERE user_id = ? ORDER BY created_at DESC LIMIT 1', @current_user.id).first
         if ride.nil?
-          halt json(data: nil, retry_after_ms: 30)
-        end
-
-        yet_sent_ride_status = tx.xquery('SELECT * FROM ride_statuses WHERE ride_id = ? AND app_sent_at IS NULL ORDER BY created_at ASC LIMIT 1', ride.fetch(:id)).first
-        status =
-          if yet_sent_ride_status.nil?
-            get_latest_ride_status(tx, ride.fetch(:id))
-          else
-            yet_sent_ride_status.fetch(:status)
-          end
-
-        fare = calculate_discounted_fare(tx, @current_user.id, ride, ride.fetch(:pickup_latitude), ride.fetch(:pickup_longitude), ride.fetch(:destination_latitude), ride.fetch(:destination_longitude))
-
-        response = {
-          data: {
-            ride_id: ride.fetch(:id),
+          { data: nil, retry_after_ms: 30 }
+        else
+          yet_sent_ride_status = tx.xquery('SELECT * FROM ride_statuses WHERE ride_id = ? AND app_sent_at IS NULL ORDER BY created_at ASC LIMIT 1', ride[:id]).first
+    
+          status =
+            if yet_sent_ride_status
+              yet_sent_ride_status[:status]
+            else
+              # 最新ステータスをキャッシュしている場合はそちらを使用
+              # なければ既存のget_latest_ride_statusをインデックス付で高速化
+              get_latest_ride_status(tx, ride[:id])
+            end
+    
+          fare = calculate_discounted_fare(tx, @current_user.id, ride, ride[:pickup_latitude], ride[:pickup_longitude], ride[:destination_latitude], ride[:destination_longitude])
+    
+          data = {
+            ride_id: ride[:id],
             pickup_coordinate: {
-              latitude: ride.fetch(:pickup_latitude),
-              longitude: ride.fetch(:pickup_longitude),
+              latitude: ride[:pickup_latitude],
+              longitude: ride[:pickup_longitude],
             },
             destination_coordinate: {
-              latitude: ride.fetch(:destination_latitude),
-              longitude: ride.fetch(:destination_longitude),
+              latitude: ride[:destination_latitude],
+              longitude: ride[:destination_longitude],
             },
-            fare:,
-            status:,
-            created_at: time_msec(ride.fetch(:created_at)),
-            updated_at: time_msec(ride.fetch(:updated_at)),
-          },
-          retry_after_ms: 30,
-        }
-
-        unless ride.fetch(:chair_id).nil?
-          chair = tx.xquery('SELECT * FROM chairs WHERE id = ?', ride.fetch(:chair_id)).first
-          stats = get_chair_stats(tx, chair.fetch(:id))
-          response[:data][:chair] = {
-            id: chair.fetch(:id),
-            name: chair.fetch(:name),
-            model: chair.fetch(:model),
-            stats:,
+            fare: fare,
+            status: status,
+            created_at: time_msec(ride[:created_at]),
+            updated_at: time_msec(ride[:updated_at]),
           }
+    
+          if ride[:chair_id]
+            chair = tx.xquery('SELECT id, name, model FROM chairs WHERE id = ?', ride[:chair_id]).first
+            # 改善後のget_chair_statsを使用（N+1解消済み）
+            stats = get_chair_stats(tx, chair[:id])
+            data[:chair] = {
+              id: chair[:id],
+              name: chair[:name],
+              model: chair[:model],
+              stats: stats,
+            }
+          end
+    
+          # ステータス通知済み更新
+          if yet_sent_ride_status
+            tx.xquery('UPDATE ride_statuses SET app_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?', yet_sent_ride_status[:id])
+          end
+    
+          { data: data, retry_after_ms: 30 }
         end
-
-        unless yet_sent_ride_status.nil?
-          tx.xquery('UPDATE ride_statuses SET app_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?', yet_sent_ride_status.fetch(:id))
-        end
-
-        response
       end
-
+    
       json(response)
     end
 
@@ -470,49 +472,59 @@ module Isuride
 
     helpers do
       def get_chair_stats(tx, chair_id)
-        rides = tx.xquery('SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC', chair_id)
-
+        rides = tx.xquery('SELECT id, evaluation FROM rides WHERE chair_id = ? ORDER BY updated_at DESC', chair_id)
+        ride_ids = rides.map { |r| r[:id] }
+        return { total_rides_count: 0, total_evaluation_avg: 0.0 } if ride_ids.empty?
+      
+        # ride_idsに対する全statusesを一回で取得
+        ride_statuses_all = tx.xquery(<<~SQL, ride_ids)
+          SELECT ride_id, status, created_at
+          FROM ride_statuses
+          WHERE ride_id IN (#{(['?'] * ride_ids.size).join(',')})
+          ORDER BY ride_id, created_at
+        SQL
+      
+        # ride_id ごとにstatusをグルーピング
+        statuses_by_ride = {}
+        ride_statuses_all.each do |rs|
+          (statuses_by_ride[rs[:ride_id]] ||= []) << rs
+        end
+      
         total_rides_count = 0
         total_evaluation = 0.0
+      
         rides.each do |ride|
-          ride_statuses = tx.xquery('SELECT * FROM ride_statuses WHERE ride_id = ? ORDER BY created_at', ride.fetch(:id))
-
+          statuses = statuses_by_ride[ride[:id]]
+          next if statuses.nil?
+      
           arrived_at = nil
           pickup_at = nil
           is_completed = false
-          ride_statuses.each do |status|
-            case status.fetch(:status)
+          statuses.each do |st|
+            case st[:status]
             when 'ARRIVED'
-              arrived_at = status.fetch(:created_at)
+              arrived_at = st[:created_at]
             when 'CARRYING'
-              pickup_at = status.fetch(:created_at)
+              pickup_at = st[:created_at]
             when 'COMPLETED'
               is_completed = true
             end
           end
-          if arrived_at.nil? || pickup_at.nil?
-            next
+      
+          if arrived_at && pickup_at && is_completed
+            total_rides_count += 1
+            total_evaluation += ride[:evaluation]
           end
-          unless is_completed
-            next
-          end
-
-          total_rides_count += 1
-          total_evaluation += ride.fetch(:evaluation)
         end
-
-        total_evaluation_avg =
-          if total_rides_count > 0
-            total_evaluation / total_rides_count
-          else
-            0.0
-          end
-
+      
+        total_evaluation_avg = total_rides_count > 0 ? (total_evaluation / total_rides_count) : 0.0
+      
         {
-          total_rides_count:,
-          total_evaluation_avg:,
+          total_rides_count: total_rides_count,
+          total_evaluation_avg: total_evaluation_avg,
         }
       end
+      
 
       def calculate_discounted_fare(tx, user_id, ride, pickup_latitude, pickup_longitude, dest_latitude, dest_longitude)
         discount =
