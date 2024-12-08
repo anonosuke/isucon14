@@ -105,45 +105,60 @@ module Isuride
     get '/notification' do
       response = db_transaction do |tx|
         ride = tx.xquery('SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1', @current_chair.id).first
-        unless ride
-          halt json(data: nil, retry_after_ms: 30)
-        end
-
-        yet_sent_ride_status = tx.xquery('SELECT * FROM ride_statuses WHERE ride_id = ? AND chair_sent_at IS NULL ORDER BY created_at ASC LIMIT 1', ride.fetch(:id)).first
-        status =
-          if yet_sent_ride_status.nil?
-            get_latest_ride_status(tx, ride.fetch(:id))
-          else
-            yet_sent_ride_status.fetch(:status)
+        if ride.nil?
+          # データなしの場合のレスポンス
+          { data: nil, retry_after_ms: 30 }
+        else
+          # ride_statusesへのアクセスを減らすため、rideテーブルにlatest_statusを持たせたと想定
+          # rideテーブルにlatest_statusがない場合は現状のクエリを高速化する
+          yet_sent_ride_status = tx.xquery(<<~SQL, ride.fetch(:id))
+            SELECT *
+            FROM ride_statuses
+            WHERE ride_id = ?
+              AND chair_sent_at IS NULL
+            ORDER BY created_at ASC
+            LIMIT 1
+          SQL
+    
+          # latest_statusをridesテーブルに持たせた場合
+          # status = ride.fetch(:latest_status)
+          # yet_sent_ride_statusがあればそちら優先
+          status =
+            if yet_sent_ride_status.first
+              yet_sent_ride_status.first.fetch(:status)
+            else
+              # インデックスにより高速化された get_latest_ride_status呼び出し
+              get_latest_ride_status(tx, ride.fetch(:id)) 
+            end
+    
+          user = tx.xquery('SELECT * FROM users WHERE id = ? FOR SHARE', ride.fetch(:user_id)).first
+    
+          if yet_sent_ride_status.first
+            tx.xquery('UPDATE ride_statuses SET chair_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?', yet_sent_ride_status.first.fetch(:id))
           end
-
-        user = tx.xquery('SELECT * FROM users WHERE id = ? FOR SHARE', ride.fetch(:user_id)).first
-
-        unless yet_sent_ride_status.nil?
-          tx.xquery('UPDATE ride_statuses SET chair_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?', yet_sent_ride_status.fetch(:id))
+    
+          {
+            data: {
+              ride_id: ride.fetch(:id),
+              user: {
+                id: user.fetch(:id),
+                name: "#{user.fetch(:firstname)} #{user.fetch(:lastname)}",
+              },
+              pickup_coordinate: {
+                latitude: ride.fetch(:pickup_latitude),
+                longitude: ride.fetch(:pickup_longitude),
+              },
+              destination_coordinate: {
+                latitude: ride.fetch(:destination_latitude),
+                longitude: ride.fetch(:destination_longitude),
+              },
+              status: status,
+            },
+            retry_after_ms: 30,
+          }
         end
-
-        {
-          data: {
-            ride_id: ride.fetch(:id),
-            user: {
-              id: user.fetch(:id),
-              name: "#{user.fetch(:firstname)} #{user.fetch(:lastname)}",
-            },
-            pickup_coordinate: {
-              latitude: ride.fetch(:pickup_latitude),
-              longitude: ride.fetch(:pickup_longitude),
-            },
-            destination_coordinate: {
-              latitude: ride.fetch(:destination_latitude),
-              longitude: ride.fetch(:destination_longitude),
-            },
-            status:,
-          },
-          retry_after_ms: 30,
-        }
       end
-
+    
       json(response)
     end
 
